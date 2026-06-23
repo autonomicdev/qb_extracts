@@ -1,6 +1,7 @@
 """
-QuickBooks Desktop - Invoice Detail Extract with Serial Numbers
+QuickBooks Desktop - Invoice + Credit Memo Detail Extract with Serial Numbers
 Outputs CSV matching the qbInvoiceDetailSN format.
+RefNumber is prefixed with "Invoice - " or "Credit Memo - " as appropriate.
 
 Local mode (run directly on the QB machine):
   python qb_invoice_extract.py [--output invoices.csv] [--from-date YYYY-MM-DD] [--to-date YYYY-MM-DD]
@@ -14,6 +15,7 @@ Remote mode (run from any machine on the LAN):
 
 import csv
 import argparse
+import os
 
 COLUMNS = [
     "InvoiceLineTxnLineID",
@@ -33,41 +35,51 @@ COLUMNS = [
     "PONumber",
 ]
 
-QBXML_TEMPLATE = """\
+# ── QBXML templates ────────────────────────────────────────────────────────────
+
+def _templates(rq_name):
+    start = f"""\
 <?xml version="1.0" encoding="utf-8"?>
 <?qbxml version="13.0"?>
 <QBXML>
   <QBXMLMsgsRq onError="stopOnError">
-    <InvoiceQueryRq requestID="1" iterator="Start">
+    <{rq_name} requestID="1" iterator="Start">
       <MaxReturned>100</MaxReturned>
-      {date_filter}
+      {{date_filter}}
       <IncludeLineItems>true</IncludeLineItems>
       <OwnerID>0</OwnerID>
-    </InvoiceQueryRq>
+    </{rq_name}>
   </QBXMLMsgsRq>
 </QBXML>"""
 
-QBXML_CONTINUE = """\
+    cont = f"""\
 <?xml version="1.0" encoding="utf-8"?>
 <?qbxml version="13.0"?>
 <QBXML>
   <QBXMLMsgsRq onError="stopOnError">
-    <InvoiceQueryRq requestID="1" iterator="Continue" iteratorID="{iterator_id}">
+    <{rq_name} requestID="1" iterator="Continue" iteratorID="{{iterator_id}}">
       <MaxReturned>100</MaxReturned>
-    </InvoiceQueryRq>
+    </{rq_name}>
   </QBXMLMsgsRq>
 </QBXML>"""
 
-QBXML_CLOSE = """\
+    stop = f"""\
 <?xml version="1.0" encoding="utf-8"?>
 <?qbxml version="13.0"?>
 <QBXML>
   <QBXMLMsgsRq onError="stopOnError">
-    <InvoiceQueryRq requestID="1" iterator="Stop" iteratorID="{iterator_id}">
-    </InvoiceQueryRq>
+    <{rq_name} requestID="1" iterator="Stop" iteratorID="{{iterator_id}}">
+    </{rq_name}>
   </QBXMLMsgsRq>
 </QBXML>"""
 
+    return start, cont, stop
+
+
+INVOICE_TEMPLATES     = _templates("InvoiceQueryRq")
+CREDITMEMO_TEMPLATES  = _templates("CreditMemoQueryRq")
+
+# ── Helpers ────────────────────────────────────────────────────────────────────
 
 def build_date_filter(from_date, to_date):
     parts = []
@@ -93,13 +105,19 @@ def extract_custom_field(data_ext_list, field_name):
     return ""
 
 
-def parse_response(xml_str):
+def parse_response(xml_str, rs_tag, ret_tag, ref_prefix):
+    """Parse a QBXML query response and return (rows, iterator_id, remaining).
+
+    rs_tag     -- e.g. 'InvoiceQueryRs' or 'CreditMemoQueryRs'
+    ret_tag    -- e.g. 'InvoiceRet' or 'CreditMemoRet'
+    ref_prefix -- e.g. 'Invoice - ' or 'Credit Memo - '
+    """
     import xml.etree.ElementTree as ET
 
     root = ET.fromstring(xml_str)
-    rs = root.find(".//InvoiceQueryRs")
+    rs = root.find(f".//{rs_tag}")
     if rs is None:
-        raise RuntimeError("No InvoiceQueryRs in response")
+        raise RuntimeError(f"No {rs_tag} in response")
 
     status_code = rs.attrib.get("statusCode", "0")
     if status_code not in ("0", "1"):
@@ -109,17 +127,18 @@ def parse_response(xml_str):
     remaining = int(rs.attrib.get("iteratorRemainingCount", "0"))
 
     rows = []
-    for inv in rs.findall("InvoiceRet"):
-        txn_date = text(inv, "TxnDate")
-        time_modified = text(inv, "TimeModified")
-        txn_number = text(inv, "TxnNumber")
-        ref_number = text(inv, "RefNumber")
-        po_number = text(inv, "PONumber")
+    for txn in rs.findall(ret_tag):
+        txn_date      = text(txn, "TxnDate")
+        time_modified = text(txn, "TimeModified")
+        txn_number    = text(txn, "TxnNumber")
+        ref_number    = ref_prefix + text(txn, "RefNumber")
+        po_number     = text(txn, "PONumber")
 
-        header_exts = inv.findall("DataExtRet")
+        header_exts = txn.findall("DataExtRet")
         commissionable_hdr = extract_custom_field(header_exts, "Commissionable")
 
-        for line in inv.findall("InvoiceLineRet"):
+        line_tag = "InvoiceLineRet" if ret_tag == "InvoiceRet" else "CreditMemoLineRet"
+        for line in txn.findall(line_tag):
             line_exts = line.findall("DataExtRet")
             rows.append({
                 "InvoiceLineTxnLineID":       text(line, "TxnLineID"),
@@ -141,6 +160,7 @@ def parse_response(xml_str):
 
     return rows, iterator_id, remaining
 
+# ── Backends ───────────────────────────────────────────────────────────────────
 
 class LocalBackend:
     def __init__(self):
@@ -176,12 +196,36 @@ class RemoteBackend:
     def close(self):
         pass
 
+# ── Query runner ───────────────────────────────────────────────────────────────
+
+def fetch_all(backend, templates, rs_tag, ret_tag, ref_prefix, date_filter):
+    """Page through a QB query and return all rows."""
+    start_tpl, cont_tpl, stop_tpl = templates
+
+    all_rows = []
+    response = backend.request(start_tpl.format(date_filter=date_filter))
+    rows, iterator_id, remaining = parse_response(response, rs_tag, ret_tag, ref_prefix)
+    all_rows.extend(rows)
+    print(f"  [{ret_tag}] Fetched {len(rows)} lines, {remaining} remaining...")
+
+    while remaining > 0 and iterator_id:
+        response = backend.request(cont_tpl.format(iterator_id=iterator_id))
+        rows, iterator_id, remaining = parse_response(response, rs_tag, ret_tag, ref_prefix)
+        all_rows.extend(rows)
+        print(f"  [{ret_tag}] Fetched {len(rows)} lines, {remaining} remaining...")
+
+    if iterator_id:
+        backend.request(stop_tpl.format(iterator_id=iterator_id))
+
+    return all_rows
+
+# ── Entry point ────────────────────────────────────────────────────────────────
 
 def main():
-    parser = argparse.ArgumentParser(description="Extract QB Desktop invoice detail to CSV")
+    parser = argparse.ArgumentParser(description="Extract QB Desktop invoices + credit memos to CSV")
     parser.add_argument("--output", default="qbInvoiceDetailSN.csv", help="Output CSV filename")
     parser.add_argument("--output-dir", default=None,
-                        help="Directory to write the output file (local path or network share, e.g. //server/share/reports)")
+                        help="Directory to write the output file (local path or network share)")
     parser.add_argument("--from-date", help="Start date YYYY-MM-DD (optional)")
     parser.add_argument("--to-date", help="End date YYYY-MM-DD (optional)")
     parser.add_argument("--qb-host", default=None,
@@ -199,27 +243,21 @@ def main():
 
     try:
         date_filter = build_date_filter(args.from_date, args.to_date)
-        first_xml = QBXML_TEMPLATE.format(date_filter=date_filter)
 
-        all_rows = []
-        response = backend.request(first_xml)
-        rows, iterator_id, remaining = parse_response(response)
-        all_rows.extend(rows)
-        print(f"  Fetched {len(rows)} lines, {remaining} invoices remaining...")
-
-        while remaining > 0 and iterator_id:
-            response = backend.request(QBXML_CONTINUE.format(iterator_id=iterator_id))
-            rows, iterator_id, remaining = parse_response(response)
-            all_rows.extend(rows)
-            print(f"  Fetched {len(rows)} lines, {remaining} invoices remaining...")
-
-        if iterator_id:
-            backend.request(QBXML_CLOSE.format(iterator_id=iterator_id))
-
+        invoices = fetch_all(
+            backend, INVOICE_TEMPLATES,
+            "InvoiceQueryRs", "InvoiceRet", "Invoice - ", date_filter,
+        )
+        credit_memos = fetch_all(
+            backend, CREDITMEMO_TEMPLATES,
+            "CreditMemoQueryRs", "CreditMemoRet", "Credit Memo - ", date_filter,
+        )
     finally:
         backend.close()
 
-    import os
+    all_rows = invoices + credit_memos
+    all_rows.sort(key=lambda r: (r["TxnDate"], r["TxnNumber"]))
+
     output_path = os.path.join(args.output_dir, args.output) if args.output_dir else args.output
 
     with open(output_path, "w", newline="", encoding="utf-8") as f:
@@ -227,7 +265,8 @@ def main():
         writer.writeheader()
         writer.writerows(all_rows)
 
-    print(f"Done. {len(all_rows)} line(s) written to {output_path}")
+    print(f"Done. {len(all_rows)} line(s) written to {output_path} "
+          f"({len(invoices)} invoice, {len(credit_memos)} credit memo)")
 
 
 if __name__ == "__main__":
