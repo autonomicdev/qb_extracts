@@ -179,7 +179,9 @@ class RemoteBackend:
 
 def main():
     parser = argparse.ArgumentParser(description="Extract QB Desktop invoice detail to CSV")
-    parser.add_argument("--output", default="qbInvoiceDetailSN.csv", help="Output CSV file path")
+    parser.add_argument("--output", default="qbInvoiceDetailSN.csv", help="Output CSV filename")
+    parser.add_argument("--output-dir", default=None,
+                        help="Directory to write the output file (local path or network share, e.g. //server/share/reports)")
     parser.add_argument("--from-date", help="Start date YYYY-MM-DD (optional)")
     parser.add_argument("--to-date", help="End date YYYY-MM-DD (optional)")
     parser.add_argument("--qb-host", default=None,
@@ -217,12 +219,15 @@ def main():
     finally:
         backend.close()
 
-    with open(args.output, "w", newline="", encoding="utf-8") as f:
+    import os
+    output_path = os.path.join(args.output_dir, args.output) if args.output_dir else args.output
+
+    with open(output_path, "w", newline="", encoding="utf-8") as f:
         writer = csv.DictWriter(f, fieldnames=COLUMNS, quoting=csv.QUOTE_ALL)
         writer.writeheader()
         writer.writerows(all_rows)
 
-    print(f"Done. {len(all_rows)} line(s) written to {args.output}")
+    print(f"Done. {len(all_rows)} line(s) written to {output_path}")
 
 
 if __name__ == "__main__":
