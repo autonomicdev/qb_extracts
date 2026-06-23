@@ -139,7 +139,7 @@ def parse_response(xml_str):
                 "InvoiceLineQuantity":        text(line, "Quantity"),
                 "InvoiceLineRate":            text(line, "Rate"),
                 "InvoiceLineAmount":          text(line, "Amount"),
-                "InvoiceLineSerialNumber":    extract_custom_field(line_exts, "Serial Number"),
+                "InvoiceLineSerialNumber":    text(line, "SerialNumber"),
                 "InvoiceLineTaxAmount":       text(line, "SalesTaxAmount"),
                 "InvoiceLineItemRefFullName": text(line, "ItemRef/FullName"),
                 "Commissionable":             extract_custom_field(line_exts, "Commissionable") or commissionable_hdr,
