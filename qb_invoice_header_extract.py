@@ -1,14 +1,13 @@
 """
-QuickBooks Desktop - Invoice + Credit Memo Detail Extract with Serial Numbers
-Outputs CSV matching the qbInvoiceDetailSN format.
-RefNumber is prefixed with "Invoice - " or "Credit Memo - " as appropriate.
+QuickBooks Desktop - Invoice / Credit Memo Header Extract
+Outputs CSV matching the qbInvoiceHeader format.
 
 Local mode (run directly on the QB machine):
-  python qb_invoice_extract.py [--output invoices.csv] [--from-date YYYY-MM-DD] [--to-date YYYY-MM-DD]
+  python qb_invoice_header_extract.py [--output qbInvoiceHeader.csv] [--from-date YYYY-MM-DD] [--to-date YYYY-MM-DD]
   Requirements: Windows + QuickBooks Desktop open, pip install pywin32
 
 Remote mode (run from any machine on the LAN):
-  python qb_invoice_extract.py --qb-host 192.168.0.81 [--qb-port 5000] [options]
+  python qb_invoice_header_extract.py --qb-host 192.168.0.81 [--qb-port 5000] [options]
   Requirements: pip install requests
   The QB machine must be running qb_server.py.
 """
@@ -18,24 +17,19 @@ import argparse
 import os
 
 COLUMNS = [
-    "InvoiceLineTxnLineID",
-    "TxnDate",
-    "TimeModified",
-    "TxnNumber",
-    "RefNumber",
-    "InvoiceLineSeqNo",
-    "InvoiceLineDesc",
-    "InvoiceLineQuantity",
-    "InvoiceLineRate",
-    "InvoiceLineAmount",
-    "InvoiceLineSerialNumber",
-    "InvoiceLineTaxAmount",
-    "InvoiceLineItemRefFullName",
-    "Commissionable",
-    "PONumber",
+    "customer_id",
+    "transaction_date",
+    "doc_num_h",
+    "amount",
+    "stage",
+    "transaction_id",
+    "open_balance",
+    "po_num",
 ]
 
-# ── QBXML templates ────────────────────────────────────────────────────────────
+# Custom DataExt field name for the opportunity stage on invoice/credit memo headers
+STAGE_FIELD_NAME = "Stage"
+
 
 def _templates(rq_name):
     start = f"""\
@@ -46,7 +40,6 @@ def _templates(rq_name):
     <{rq_name} requestID="1" iterator="Start">
       <MaxReturned>100</MaxReturned>
       {{date_filter}}
-      <IncludeLineItems>true</IncludeLineItems>
       <OwnerID>0</OwnerID>
     </{rq_name}>
   </QBXMLMsgsRq>
@@ -76,10 +69,9 @@ def _templates(rq_name):
     return start, cont, stop
 
 
-INVOICE_TEMPLATES     = _templates("InvoiceQueryRq")
-CREDITMEMO_TEMPLATES  = _templates("CreditMemoQueryRq")
+INVOICE_TEMPLATES    = _templates("InvoiceQueryRq")
+CREDITMEMO_TEMPLATES = _templates("CreditMemoQueryRq")
 
-# ── Helpers ────────────────────────────────────────────────────────────────────
 
 def build_date_filter(from_date, to_date):
     parts = []
@@ -105,13 +97,15 @@ def extract_custom_field(data_ext_list, field_name):
     return ""
 
 
-def parse_response(xml_str, rs_tag, ret_tag, ref_prefix):
-    """Parse a QBXML query response and return (rows, iterator_id, remaining).
+def format_date(iso_date):
+    """Convert YYYY-MM-DD to MM/DD/YYYY."""
+    if iso_date and len(iso_date) == 10:
+        y, m, d = iso_date.split("-")
+        return f"{m}/{d}/{y}"
+    return iso_date
 
-    rs_tag     -- e.g. 'InvoiceQueryRs' or 'CreditMemoQueryRs'
-    ret_tag    -- e.g. 'InvoiceRet' or 'CreditMemoRet'
-    ref_prefix -- e.g. 'Invoice - ' or 'Credit Memo - '
-    """
+
+def parse_response(xml_str, rs_tag, ret_tag, ref_prefix):
     import xml.etree.ElementTree as ET
 
     root = ET.fromstring(xml_str)
@@ -128,37 +122,20 @@ def parse_response(xml_str, rs_tag, ret_tag, ref_prefix):
 
     rows = []
     for txn in rs.findall(ret_tag):
-        txn_date      = text(txn, "TxnDate")
-        time_modified = text(txn, "TimeModified")
-        txn_number    = text(txn, "TxnNumber")
-        ref_number    = ref_prefix + text(txn, "RefNumber")
-        po_number     = text(txn, "PONumber")
-
         header_exts = txn.findall("DataExtRet")
-        commissionable_hdr = extract_custom_field(header_exts, "Commissionable")
-
-        line_tag = "InvoiceLineRet" if ret_tag == "InvoiceRet" else "CreditMemoLineRet"
-        for line in txn.findall(line_tag):
-            line_exts = line.findall("DataExtRet")
-            rows.append({
-                "InvoiceLineTxnLineID":       text(line, "TxnLineID"),
-                "TxnDate":                    txn_date,
-                "TimeModified":               time_modified,
-                "TxnNumber":                  txn_number,
-                "RefNumber":                  ref_number,
-                "InvoiceLineSeqNo":           text(line, "SeqNo"),
-                "InvoiceLineDesc":            text(line, "Desc"),
-                "InvoiceLineQuantity":        text(line, "Quantity"),
-                "InvoiceLineRate":            text(line, "Rate"),
-                "InvoiceLineAmount":          text(line, "Amount"),
-                "InvoiceLineSerialNumber":    text(line, "SerialNumber"),
-                "InvoiceLineTaxAmount":       text(line, "SalesTaxAmount"),
-                "InvoiceLineItemRefFullName": text(line, "ItemRef/FullName"),
-                "Commissionable":             extract_custom_field(line_exts, "Commissionable") or commissionable_hdr,
-                "PONumber":                   po_number,
-            })
+        rows.append({
+            "customer_id":      text(txn, "CustomerRef/ListID"),
+            "transaction_date": format_date(text(txn, "TxnDate")),
+            "doc_num_h":        ref_prefix + text(txn, "RefNumber"),
+            "amount":           text(txn, "SubTotal") or text(txn, "TotalAmount"),
+            "stage":            extract_custom_field(header_exts, STAGE_FIELD_NAME),
+            "transaction_id":   text(txn, "TxnNumber"),
+            "open_balance":     text(txn, "BalanceRemaining"),
+            "po_num":           text(txn, "PONumber"),
+        })
 
     return rows, iterator_id, remaining
+
 
 # ── Backends ───────────────────────────────────────────────────────────────────
 
@@ -166,7 +143,7 @@ class LocalBackend:
     def __init__(self):
         import win32com.client
         self.rp = win32com.client.Dispatch("QBXMLRP2.RequestProcessor")
-        self.rp.OpenConnection2("", "QB Invoice Extract", 1)
+        self.rp.OpenConnection2("", "QB Invoice Header Extract", 1)
         self.ticket = self.rp.BeginSession("", 2)
 
     def request(self, xml):
@@ -196,34 +173,35 @@ class RemoteBackend:
     def close(self):
         pass
 
+
 # ── Query runner ───────────────────────────────────────────────────────────────
 
 def fetch_all(backend, templates, rs_tag, ret_tag, ref_prefix, date_filter):
-    """Page through a QB query and return all rows."""
     start_tpl, cont_tpl, stop_tpl = templates
 
     all_rows = []
     response = backend.request(start_tpl.format(date_filter=date_filter))
     rows, iterator_id, remaining = parse_response(response, rs_tag, ret_tag, ref_prefix)
     all_rows.extend(rows)
-    print(f"  [{ret_tag}] Fetched {len(rows)} lines, {remaining} remaining...")
+    print(f"  [{ret_tag}] Fetched {len(rows)} records, {remaining} remaining...")
 
     while remaining > 0 and iterator_id:
         response = backend.request(cont_tpl.format(iterator_id=iterator_id))
         rows, iterator_id, remaining = parse_response(response, rs_tag, ret_tag, ref_prefix)
         all_rows.extend(rows)
-        print(f"  [{ret_tag}] Fetched {len(rows)} lines, {remaining} remaining...")
+        print(f"  [{ret_tag}] Fetched {len(rows)} records, {remaining} remaining...")
 
     if iterator_id:
         backend.request(stop_tpl.format(iterator_id=iterator_id))
 
     return all_rows
 
+
 # ── Entry point ────────────────────────────────────────────────────────────────
 
 def main():
-    parser = argparse.ArgumentParser(description="Extract QB Desktop invoices + credit memos to CSV")
-    parser.add_argument("--output", default="qbInvoiceDetailSN.csv", help="Output CSV filename")
+    parser = argparse.ArgumentParser(description="Extract QB Desktop invoice/credit memo headers to CSV")
+    parser.add_argument("--output", default="qbInvoiceHeader.csv", help="Output CSV filename")
     parser.add_argument("--output-dir", default=None,
                         help="Directory to write the output file (local path or network share)")
     parser.add_argument("--from-date", help="Start date YYYY-MM-DD (optional)")
@@ -256,7 +234,7 @@ def main():
         backend.close()
 
     all_rows = invoices + credit_memos
-    all_rows.sort(key=lambda r: (r["TxnDate"], r["TxnNumber"]))
+    all_rows.sort(key=lambda r: r["transaction_date"])
 
     output_path = os.path.join(args.output_dir, args.output) if args.output_dir else args.output
 
@@ -265,7 +243,7 @@ def main():
         writer.writeheader()
         writer.writerows(all_rows)
 
-    print(f"Done. {len(all_rows)} line(s) written to {output_path} "
+    print(f"Done. {len(all_rows)} record(s) written to {output_path} "
           f"({len(invoices)} invoice, {len(credit_memos)} credit memo)")
 
 
