@@ -37,7 +37,9 @@ COLUMNS = [
 
 # ── QBXML templates ────────────────────────────────────────────────────────────
 
-def _templates(rq_name):
+# Pass 1: iterate to collect TxnIDs only (no line items — avoids QB bug where
+# IncludeLineItems is silently dropped on iterator Continue pages).
+def _id_templates(rq_name):
     start = f"""\
 <?xml version="1.0" encoding="utf-8"?>
 <?qbxml version="13.0"?>
@@ -46,7 +48,6 @@ def _templates(rq_name):
     <{rq_name} requestID="1" iterator="Start">
       <MaxReturned>100</MaxReturned>
       {{date_filter}}
-      <IncludeLineItems>true</IncludeLineItems>
       <OwnerID>0</OwnerID>
     </{rq_name}>
   </QBXMLMsgsRq>
@@ -76,8 +77,24 @@ def _templates(rq_name):
     return start, cont, stop
 
 
-INVOICE_TEMPLATES     = _templates("InvoiceQueryRq")
-CREDITMEMO_TEMPLATES  = _templates("CreditMemoQueryRq")
+# Pass 2: fetch full line detail for a batch of TxnIDs.
+def build_txnid_query(rq_name, txn_ids):
+    id_elements = "".join(f"      <TxnID>{tid}</TxnID>\n" for tid in txn_ids)
+    return f"""\
+<?xml version="1.0" encoding="utf-8"?>
+<?qbxml version="13.0"?>
+<QBXML>
+  <QBXMLMsgsRq onError="stopOnError">
+    <{rq_name} requestID="1">
+{id_elements}      <IncludeLineItems>true</IncludeLineItems>
+      <OwnerID>0</OwnerID>
+    </{rq_name}>
+  </QBXMLMsgsRq>
+</QBXML>"""
+
+
+INVOICE_ID_TEMPLATES    = _id_templates("InvoiceQueryRq")
+CREDITMEMO_ID_TEMPLATES = _id_templates("CreditMemoQueryRq")
 
 # ── Helpers ────────────────────────────────────────────────────────────────────
 
@@ -105,13 +122,8 @@ def extract_custom_field(data_ext_list, field_name):
     return ""
 
 
-def parse_response(xml_str, rs_tag, ret_tag, ref_prefix):
-    """Parse a QBXML query response and return (rows, iterator_id, remaining).
-
-    rs_tag     -- e.g. 'InvoiceQueryRs' or 'CreditMemoQueryRs'
-    ret_tag    -- e.g. 'InvoiceRet' or 'CreditMemoRet'
-    ref_prefix -- e.g. 'Invoice - ' or 'Credit Memo - '
-    """
+def parse_txn_ids(xml_str, rs_tag, ret_tag):
+    """Pass 1: extract TxnIDs from an iterator response."""
     import xml.etree.ElementTree as ET
 
     root = ET.fromstring(xml_str)
@@ -125,8 +137,26 @@ def parse_response(xml_str, rs_tag, ret_tag, ref_prefix):
 
     iterator_id = rs.attrib.get("iteratorID", "")
     remaining = int(rs.attrib.get("iteratorRemainingCount", "0"))
+    txn_ids = [text(txn, "TxnID") for txn in rs.findall(ret_tag)]
+    return txn_ids, iterator_id, remaining
+
+
+def parse_detail(xml_str, rs_tag, ret_tag, ref_prefix):
+    """Pass 2: extract line rows from a TxnID-based detail response."""
+    import xml.etree.ElementTree as ET
+
+    root = ET.fromstring(xml_str)
+    rs = root.find(f".//{rs_tag}")
+    if rs is None:
+        raise RuntimeError(f"No {rs_tag} in response")
+
+    status_code = rs.attrib.get("statusCode", "0")
+    if status_code not in ("0", "1"):
+        raise RuntimeError(f"QB error {status_code}: {rs.attrib.get('statusMessage')}")
 
     rows = []
+    line_tag = "InvoiceLineRet" if ret_tag == "InvoiceRet" else "CreditMemoLineRet"
+
     for txn in rs.findall(ret_tag):
         txn_date      = text(txn, "TxnDate")
         time_modified = text(txn, "TimeModified")
@@ -137,7 +167,6 @@ def parse_response(xml_str, rs_tag, ret_tag, ref_prefix):
         header_exts = txn.findall("DataExtRet")
         commissionable_hdr = extract_custom_field(header_exts, "Commissionable")
 
-        line_tag = "InvoiceLineRet" if ret_tag == "InvoiceRet" else "CreditMemoLineRet"
         for line in txn.findall(line_tag):
             line_exts = line.findall("DataExtRet")
             rows.append({
@@ -158,7 +187,7 @@ def parse_response(xml_str, rs_tag, ret_tag, ref_prefix):
                 "PONumber":                   po_number,
             })
 
-    return rows, iterator_id, remaining
+    return rows
 
 # ── Backends ───────────────────────────────────────────────────────────────────
 
@@ -198,24 +227,43 @@ class RemoteBackend:
 
 # ── Query runner ───────────────────────────────────────────────────────────────
 
-def fetch_all(backend, templates, rs_tag, ret_tag, ref_prefix, date_filter):
-    """Page through a QB query and return all rows."""
-    start_tpl, cont_tpl, stop_tpl = templates
+# QB QBXML bug: IncludeLineItems is silently ignored on iterator Continue pages,
+# returning 0 lines for every page after the first. Fix: two-pass approach —
+# pass 1 collects all TxnIDs via the iterator (no line items), then pass 2
+# fetches full line detail in batches by TxnID.
+BATCH_SIZE = 50  # TxnIDs per detail request
 
-    all_rows = []
+
+def fetch_all(backend, id_templates, rq_name, rs_tag, ret_tag, ref_prefix, date_filter):
+    start_tpl, cont_tpl, stop_tpl = id_templates
+
+    # Pass 1: collect all TxnIDs
+    all_txn_ids = []
     response = backend.request(start_tpl.format(date_filter=date_filter))
-    rows, iterator_id, remaining = parse_response(response, rs_tag, ret_tag, ref_prefix)
-    all_rows.extend(rows)
-    print(f"  [{ret_tag}] Fetched {len(rows)} lines, {remaining} remaining...")
+    txn_ids, iterator_id, remaining = parse_txn_ids(response, rs_tag, ret_tag)
+    all_txn_ids.extend(txn_ids)
+    print(f"  [{ret_tag}] Collected {len(txn_ids)} IDs, {remaining} remaining...")
 
     while remaining > 0 and iterator_id:
         response = backend.request(cont_tpl.format(iterator_id=iterator_id))
-        rows, iterator_id, remaining = parse_response(response, rs_tag, ret_tag, ref_prefix)
-        all_rows.extend(rows)
-        print(f"  [{ret_tag}] Fetched {len(rows)} lines, {remaining} remaining...")
+        txn_ids, iterator_id, remaining = parse_txn_ids(response, rs_tag, ret_tag)
+        all_txn_ids.extend(txn_ids)
+        print(f"  [{ret_tag}] Collected {len(txn_ids)} IDs, {remaining} remaining...")
 
     if iterator_id:
         backend.request(stop_tpl.format(iterator_id=iterator_id))
+
+    print(f"  [{ret_tag}] {len(all_txn_ids)} total — fetching line detail...")
+
+    # Pass 2: fetch line detail in batches by TxnID
+    all_rows = []
+    for i in range(0, len(all_txn_ids), BATCH_SIZE):
+        batch = all_txn_ids[i:i + BATCH_SIZE]
+        xml = build_txnid_query(rq_name, batch)
+        response = backend.request(xml)
+        rows = parse_detail(response, rs_tag, ret_tag, ref_prefix)
+        all_rows.extend(rows)
+        print(f"  [{ret_tag}] Detail batch {i // BATCH_SIZE + 1}: {len(rows)} lines")
 
     return all_rows
 
@@ -245,11 +293,11 @@ def main():
         date_filter = build_date_filter(args.from_date, args.to_date)
 
         invoices = fetch_all(
-            backend, INVOICE_TEMPLATES,
+            backend, INVOICE_ID_TEMPLATES, "InvoiceQueryRq",
             "InvoiceQueryRs", "InvoiceRet", "Invoice - ", date_filter,
         )
         credit_memos = fetch_all(
-            backend, CREDITMEMO_TEMPLATES,
+            backend, CREDITMEMO_ID_TEMPLATES, "CreditMemoQueryRq",
             "CreditMemoQueryRs", "CreditMemoRet", "Credit Memo - ", date_filter,
         )
     finally:
