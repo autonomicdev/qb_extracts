@@ -72,6 +72,39 @@ def _templates(rq_name):
 INVOICE_TEMPLATES    = _templates("InvoiceQueryRq")
 CREDITMEMO_TEMPLATES = _templates("CreditMemoQueryRq")
 
+CUSTOMER_QUERY = """\
+<?xml version="1.0" encoding="utf-8"?>
+<?qbxml version="13.0"?>
+<QBXML>
+  <QBXMLMsgsRq onError="stopOnError">
+    <CustomerQueryRq requestID="1" iterator="Start">
+      <MaxReturned>200</MaxReturned>
+      <ActiveStatus>All</ActiveStatus>
+    </CustomerQueryRq>
+  </QBXMLMsgsRq>
+</QBXML>"""
+
+CUSTOMER_QUERY_CONT = """\
+<?xml version="1.0" encoding="utf-8"?>
+<?qbxml version="13.0"?>
+<QBXML>
+  <QBXMLMsgsRq onError="stopOnError">
+    <CustomerQueryRq requestID="1" iterator="Continue" iteratorID="{iterator_id}">
+      <MaxReturned>200</MaxReturned>
+    </CustomerQueryRq>
+  </QBXMLMsgsRq>
+</QBXML>"""
+
+CUSTOMER_QUERY_STOP = """\
+<?xml version="1.0" encoding="utf-8"?>
+<?qbxml version="13.0"?>
+<QBXML>
+  <QBXMLMsgsRq onError="stopOnError">
+    <CustomerQueryRq requestID="1" iterator="Stop" iteratorID="{iterator_id}">
+    </CustomerQueryRq>
+  </QBXMLMsgsRq>
+</QBXML>"""
+
 
 def build_date_filter(from_date, to_date):
     parts = []
@@ -105,7 +138,44 @@ def format_date(iso_date):
     return iso_date
 
 
-def parse_response(xml_str, rs_tag, ret_tag, ref_prefix):
+def build_customer_map(backend):
+    """Return a dict mapping CustomerRef ListID -> AccountNumber for all customers."""
+    import xml.etree.ElementTree as ET
+
+    customer_map = {}
+
+    def _parse(xml_str):
+        root = ET.fromstring(xml_str)
+        rs = root.find(".//CustomerQueryRs")
+        if rs is None:
+            raise RuntimeError("No CustomerQueryRs in response")
+        status_code = rs.attrib.get("statusCode", "0")
+        if status_code not in ("0", "1"):
+            raise RuntimeError(f"QB error {status_code}: {rs.attrib.get('statusMessage')}")
+        for cust in rs.findall("CustomerRet"):
+            list_id = text(cust, "ListID")
+            account_number = text(cust, "AccountNumber")
+            if list_id:
+                customer_map[list_id] = account_number
+        return rs.attrib.get("iteratorID", ""), int(rs.attrib.get("iteratorRemainingCount", "0"))
+
+    iterator_id, remaining = _parse(backend.request(CUSTOMER_QUERY))
+    print(f"  [CustomerRet] Fetched {len(customer_map)} customers, {remaining} remaining...")
+
+    while remaining > 0 and iterator_id:
+        iterator_id, remaining = _parse(
+            backend.request(CUSTOMER_QUERY_CONT.format(iterator_id=iterator_id))
+        )
+        print(f"  [CustomerRet] Fetched {len(customer_map)} customers total, {remaining} remaining...")
+
+    if iterator_id:
+        backend.request(CUSTOMER_QUERY_STOP.format(iterator_id=iterator_id))
+
+    print(f"  [CustomerRet] Customer map built: {len(customer_map)} entries")
+    return customer_map
+
+
+def parse_response(xml_str, rs_tag, ret_tag, ref_prefix, customer_map):
     import xml.etree.ElementTree as ET
 
     root = ET.fromstring(xml_str)
@@ -122,9 +192,10 @@ def parse_response(xml_str, rs_tag, ret_tag, ref_prefix):
 
     rows = []
     for txn in rs.findall(ret_tag):
+        list_id = text(txn, "CustomerRef/ListID")
         header_exts = txn.findall("DataExtRet")
         rows.append({
-            "customer_id":      text(txn, "CustomerRef/ListID"),
+            "customer_id":      customer_map.get(list_id, list_id),
             "transaction_date": format_date(text(txn, "TxnDate")),
             "doc_num_h":        ref_prefix + text(txn, "RefNumber"),
             "amount":           text(txn, "SubTotal") or text(txn, "TotalAmount"),
@@ -176,18 +247,18 @@ class RemoteBackend:
 
 # ── Query runner ───────────────────────────────────────────────────────────────
 
-def fetch_all(backend, templates, rs_tag, ret_tag, ref_prefix, date_filter):
+def fetch_all(backend, templates, rs_tag, ret_tag, ref_prefix, date_filter, customer_map):
     start_tpl, cont_tpl, stop_tpl = templates
 
     all_rows = []
     response = backend.request(start_tpl.format(date_filter=date_filter))
-    rows, iterator_id, remaining = parse_response(response, rs_tag, ret_tag, ref_prefix)
+    rows, iterator_id, remaining = parse_response(response, rs_tag, ret_tag, ref_prefix, customer_map)
     all_rows.extend(rows)
     print(f"  [{ret_tag}] Fetched {len(rows)} records, {remaining} remaining...")
 
     while remaining > 0 and iterator_id:
         response = backend.request(cont_tpl.format(iterator_id=iterator_id))
-        rows, iterator_id, remaining = parse_response(response, rs_tag, ret_tag, ref_prefix)
+        rows, iterator_id, remaining = parse_response(response, rs_tag, ret_tag, ref_prefix, customer_map)
         all_rows.extend(rows)
         print(f"  [{ret_tag}] Fetched {len(rows)} records, {remaining} remaining...")
 
@@ -220,15 +291,17 @@ def main():
         print("Local mode: connecting to QuickBooks on this machine")
 
     try:
+        print("Building customer map...")
+        customer_map = build_customer_map(backend)
         date_filter = build_date_filter(args.from_date, args.to_date)
 
         invoices = fetch_all(
             backend, INVOICE_TEMPLATES,
-            "InvoiceQueryRs", "InvoiceRet", "Invoice - ", date_filter,
+            "InvoiceQueryRs", "InvoiceRet", "Invoice - ", date_filter, customer_map,
         )
         credit_memos = fetch_all(
             backend, CREDITMEMO_TEMPLATES,
-            "CreditMemoQueryRs", "CreditMemoRet", "Credit Memo - ", date_filter,
+            "CreditMemoQueryRs", "CreditMemoRet", "Credit Memo - ", date_filter, customer_map,
         )
     finally:
         backend.close()
