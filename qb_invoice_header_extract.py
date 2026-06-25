@@ -156,11 +156,11 @@ def _customer_map_odbc(qb_dsn):
     conn = pyodbc.connect(f"FileDSN={qb_dsn}", autocommit=True)
     try:
         cursor = conn.cursor()
-        cursor.execute("SELECT list_ident, id FROM v_lst_customer")
+        cursor.execute("SELECT list_ident, cf_customer_id FROM v_lst_customer")
         customer_map = {
-            row.list_ident.strip(): str(int(row.id))
+            row.list_ident.strip(): (row.cf_customer_id.strip() if row.cf_customer_id else "")
             for row in cursor
-            if row.list_ident and row.id is not None
+            if row.list_ident
         }
     finally:
         conn.close()
