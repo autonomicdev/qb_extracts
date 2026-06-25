@@ -7,7 +7,7 @@ import sys
 from datetime import date, timedelta
 
 today = date.today()
-from_date = (today - timedelta(days=90)).strftime("%Y-%m-%d")
+from_date = (today - timedelta(days=360)).strftime("%Y-%m-%d")
 to_date = today.strftime("%Y-%m-%d")
 
 subprocess.run([
