@@ -138,8 +138,37 @@ def format_date(iso_date):
     return iso_date
 
 
-def build_customer_map(backend):
-    """Return a dict mapping CustomerRef ListID -> AccountNumber for all customers."""
+def build_customer_map(backend, qb_dsn=None):
+    """Return dict mapping QB ListID -> customer id (as string).
+
+    When --qb-dsn is supplied, queries v_lst_customer via ODBC using
+    list_ident -> id (the native 4-digit integer used in Crystal Reports).
+    Falls back to QBXML AccountNumber when no DSN is provided.
+    """
+    if qb_dsn:
+        return _customer_map_odbc(qb_dsn)
+    return _customer_map_qbxml(backend)
+
+
+def _customer_map_odbc(qb_dsn):
+    import pyodbc
+    print(f"  [CustomerMap] Querying v_lst_customer via ODBC DSN: {qb_dsn}")
+    conn = pyodbc.connect(f"FileDSN={qb_dsn}", autocommit=True)
+    try:
+        cursor = conn.cursor()
+        cursor.execute("SELECT list_ident, id FROM v_lst_customer")
+        customer_map = {
+            row.list_ident.strip(): str(int(row.id))
+            for row in cursor
+            if row.list_ident and row.id is not None
+        }
+    finally:
+        conn.close()
+    print(f"  [CustomerMap] {len(customer_map)} customers loaded from ODBC")
+    return customer_map
+
+
+def _customer_map_qbxml(backend):
     import xml.etree.ElementTree as ET
 
     customer_map = {}
@@ -160,18 +189,18 @@ def build_customer_map(backend):
         return rs.attrib.get("iteratorID", ""), int(rs.attrib.get("iteratorRemainingCount", "0"))
 
     iterator_id, remaining = _parse(backend.request(CUSTOMER_QUERY))
-    print(f"  [CustomerRet] Fetched {len(customer_map)} customers, {remaining} remaining...")
+    print(f"  [CustomerMap] {len(customer_map)} customers via QBXML, {remaining} remaining...")
 
     while remaining > 0 and iterator_id:
         iterator_id, remaining = _parse(
             backend.request(CUSTOMER_QUERY_CONT.format(iterator_id=iterator_id))
         )
-        print(f"  [CustomerRet] Fetched {len(customer_map)} customers total, {remaining} remaining...")
+        print(f"  [CustomerMap] {len(customer_map)} customers total, {remaining} remaining...")
 
     if iterator_id:
         backend.request(CUSTOMER_QUERY_STOP.format(iterator_id=iterator_id))
 
-    print(f"  [CustomerRet] Customer map built: {len(customer_map)} entries")
+    print(f"  [CustomerMap] {len(customer_map)} customers loaded from QBXML")
     return customer_map
 
 
@@ -281,6 +310,8 @@ def main():
                         help="IP/hostname of QB machine running qb_server.py (omit to run locally)")
     parser.add_argument("--qb-port", type=int, default=5000,
                         help="Port qb_server.py is listening on (default 5000)")
+    parser.add_argument("--qb-dsn", default=None,
+                        help=r"Path to QB ODBC File DSN (e.g. C:\QB\company.dsn) for customer ID lookup via v_lst_customer")
     args = parser.parse_args()
 
     if args.qb_host:
@@ -292,7 +323,7 @@ def main():
 
     try:
         print("Building customer map...")
-        customer_map = build_customer_map(backend)
+        customer_map = build_customer_map(backend, args.qb_dsn)
         date_filter = build_date_filter(args.from_date, args.to_date)
 
         invoices = fetch_all(
