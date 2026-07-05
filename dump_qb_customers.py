@@ -6,8 +6,8 @@ Requirements:
   pip install pyodbc
 
 Usage:
-  python dump_qb_customers.py --dsn "C:\path\to\company.qbw.DSN"
-  python dump_qb_customers.py --dsn "C:\Users\Public\Documents\Intuit\QuickBooks\Company Files\autonomic.qbw.DSN"
+  python dump_qb_customers.py --dsn "C:\\path\\to\\company.qbw.DSN"
+  python dump_qb_customers.py --dsn "C:\\Users\\Public\\Documents\\Intuit\\QuickBooks\\Company Files\\autonomic.qbw.DSN"
 """
 
 import csv
